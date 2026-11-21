@@ -8,6 +8,7 @@
       {% if is_current %}<span class="badge current">当前生效</span>{% else %}<span class="badge">历史只读</span>{% endif %}
       <span class="muted small">{{ run.created_at }}</span>
     </h2>
+    <a class="button ghost" href="{{ url_for('screen', run_id=run.id) }}">同错邻座筛查</a>
     <a class="button ghost" href="{{ url_for('export_run', run_id=run.id) }}">导出 CSV</a>
   </div>
   {% if not is_current %}
@@ -16,6 +17,48 @@
       核对结论保存后将以最新统计为准。</p>
   {% endif %}
   {% include "_stats_table.html" %}
+</section>
+
+<section class="card">
+  <h2>快照内的卡与卷式</h2>
+  <p class="muted small">生成该快照时各卡的相容卷式，以及按每种相容卷式归一的实扫作答（空为漏扫/空答）。</p>
+  {% if run.card_forms %}
+    {% for card in run.card_forms %}
+      <details class="card-forms">
+        <summary>
+          <strong>{{ card.card_no }}</strong>
+          <span class="muted small">{{ card.forms|length }} 种相容卷式</span>
+        </summary>
+        <div class="table-wrap">
+        <table class="compact">
+          <thead>
+            <tr><th>标准题码</th>
+            {% for f in card.forms %}
+              <th>{{ f.form_name }}<br><span class="muted small">印刷题号 / 涂选 / 归一</span></th>
+            {% endfor %}
+          </tr>
+          </thead>
+          <tbody>
+          {% for code in card.codes %}
+            <tr>
+              <td class="code">{{ code }}</td>
+              {% for f in card.forms %}
+                {% set a = f.answers.get(code) %}
+                <td>
+                  {% if a %}{{ a.q_no }} / {{ a.letter or '—' }} / <strong>{{ a.std_option or '—' }}</strong>
+                  {% else %}<span class="muted">未印</span>{% endif %}
+                </td>
+              {% endfor %}
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      </details>
+    {% endfor %}
+  {% else %}
+    <p class="muted">该快照生成时尚未记录卡的相容卷式（旧快照），因此无法用于同错邻座筛查。</p>
+  {% endif %}
 </section>
 
 <section class="card">

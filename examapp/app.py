@@ -361,6 +361,41 @@ def read_run(conn, run_id: int) -> dict | None:
         )
     ]
 
+    # Frozen per-card screening data: compatible forms and the answer each
+    # printed question normalises to under each form.  Read from the snapshot
+    # tables only, so later uploads/corrections cannot rewrite history.
+    forms_by_card: dict[str, list[dict]] = {}
+    for r in conn.execute(
+        "SELECT card_no, form_id, form_name FROM run_card_forms "
+        "WHERE run_id = ? ORDER BY card_no, form_order, form_id", (run_id,)
+    ):
+        forms_by_card.setdefault(r["card_no"], []).append(
+            {"form_id": r["form_id"], "form_name": r["form_name"], "answers": {}}
+        )
+    form_index = {
+        (card_no, f["form_id"]): f
+        for card_no, forms in forms_by_card.items() for f in forms
+    }
+    for r in conn.execute(
+        "SELECT card_no, form_id, std_code, q_no, letter, std_option "
+        "FROM run_card_form_answers WHERE run_id = ? ORDER BY card_no, q_no",
+        (run_id,),
+    ):
+        f = form_index.get((r["card_no"], r["form_id"]))
+        if f is not None:
+            f["answers"][r["std_code"]] = {
+                "q_no": r["q_no"], "letter": r["letter"],
+                "std_option": r["std_option"],
+            }
+    card_forms = []
+    for card_no in sorted(forms_by_card, key=engine._natural_key):
+        forms = forms_by_card[card_no]
+        codes = sorted(
+            {code for f in forms for code in f["answers"]}, key=engine._natural_key,
+        )
+        card_forms.append({"card_no": card_no, "forms": forms, "codes": codes})
+    screenable = bool(card_forms)
+
     return {
         "id": run["id"],
         "created_at": run["created_at"],
@@ -369,6 +404,8 @@ def read_run(conn, run_id: int) -> dict | None:
         "cards": cards,
         "flagged": flagged,
         "unmatched": unmatched,
+        "card_forms": card_forms,
+        "screenable": screenable,
         "all_options": sorted(
             {o for s in stats.values() for o in s["options"]},
             key=engine._natural_key,
@@ -545,6 +582,71 @@ def register_routes(app: Flask):
             "resolution": resolution, "note": note,
         })
         return _back(None, f"卡号 {card_no} / 题码 {code} 的核对结论已受理")
+
+    @app.get("/runs/<int:run_id>/screen")
+    def screen(run_id: int):
+        """Upload screen; POST does the work (files cannot live in a link)."""
+        conn = get_db()
+        view = read_run(conn, run_id)
+        if view is None:
+            return render_template("missing.html"), 404
+        current = active_run_id(conn)
+        return render_template(
+            "screen.html", run=view, is_current=(run_id == current),
+            active_run_id=current, result=None,
+            max_seats=engine.SCREEN_MAX_SEATS,
+            max_forms=engine.SCREEN_MAX_FORMS_PER_CARD,
+            error=request.args.get("error"), message=request.args.get("message"),
+        )
+
+    @app.post("/runs/<int:run_id>/screen")
+    def run_screen(run_id: int):
+        conn = get_db()
+        view = read_run(conn, run_id)
+        if view is None:
+            return render_template("missing.html"), 404
+        current = active_run_id(conn)
+
+        def page(error=None, message=None, result=None, status=200):
+            return render_template(
+                "screen.html", run=view, is_current=(run_id == current),
+                active_run_id=current, result=result, status=status,
+                max_seats=engine.SCREEN_MAX_SEATS,
+                max_forms=engine.SCREEN_MAX_FORMS_PER_CARD,
+                error=error, message=message,
+            ), status
+
+        if not view["screenable"]:
+            return page(error=(
+                "该快照生成时尚未记录各卡的相容卷式与归一作答，无法筛查。"
+                "请先导入答题数据生成新快照后再试。"
+            ), status=422)
+        seat_file = request.files.get("seats")
+        key_file = request.files.get("key")
+        if seat_file is None or not seat_file.filename:
+            return page(error="请选择座位 CSV 文件", status=400)
+        if key_file is None or not key_file.filename:
+            return page(error="请选择答案 CSV 文件", status=400)
+        try:
+            seat_rows = engine.parse_seat_csv(seat_file.read())
+            answer_key = engine.parse_key_csv(key_file.read())
+        except engine.ValidationError as exc:
+            return page(error=str(exc), status=400)
+
+        threshold_text = (request.form.get("threshold") or "").strip()
+        result = None
+        try:
+            result = engine.screen_snapshot(
+                conn, run_id, seat_rows, answer_key, threshold_text,
+            )
+        except engine.ScreenError as exc:
+            return page(error=str(exc), status=400)
+
+        message = (
+            f"共 {len(result.matches)} 对邻座达到同错 ≥{result.threshold} 题"
+            if result.matches else None
+        )
+        return page(message=message, result=result, status=200)
 
     @app.get("/api/status")
     def api_status():

@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}同错邻座筛查 · 快照 #{{ run.id }}{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="row-between">
+    <h2>
+      同错邻座筛查
+      <span class="badge">快照 #{{ run.id }}</span>
+      {% if is_current %}<span class="badge current">当前生效</span>{% else %}<span class="badge">历史快照</span>{% endif %}
+    </h2>
+    <a class="button ghost" href="{{ url_for('run_detail', run_id=run.id) }}">返回统计快照</a>
+  </div>
+  <p class="muted">
+    只使用快照 #{{ run.id }} 生成时记录的每张卡“相容卷式 + 按卷式归一的实扫作答”进行筛查；
+    之后重新上传答题或订正卷式都不会改变该快照的筛查依据。
+  </p>
+
+  {% if not run.screenable %}
+    <div class="banner error">
+      该快照生成时尚未记录各卡的相容卷式与归一作答，无法筛查。
+      请先导入答题数据或补交卷式生成新快照后再试。
+    </div>
+  {% else %}
+  <form method="post" action="{{ url_for('run_screen', run_id=run.id) }}"
+        enctype="multipart/form-data" class="screen-form">
+    <label>
+      座位 CSV（<code>座号, 卡号</code>，各列唯一，最多 {{ max_seats }} 个座位）
+      <input type="file" name="seats" accept=".csv,text/csv" required>
+    </label>
+    <label>
+      答案 CSV（<code>标准题码, 正确标准选项</code>）
+      <input type="file" name="key" accept=".csv,text/csv" required>
+    </label>
+    <label>
+      同错题数下限
+      <input type="number" name="threshold" min="1" max="{{ max_seats - 1 }}"
+             value="{{ result.threshold if result else 3 }}" required>
+    </label>
+    <button type="submit">开始筛查</button>
+  </form>
+  <p class="muted small">
+    只比较座号自然顺序相邻的两张卡；每卡只能采用一种相容卷式（每卡最多 {{ max_forms }} 种），
+    整排统一求解。答案表中的题，两卡归一后选中同一个错误选项才算同错；空答不计。
+  </p>
+  {% endif %}
+</section>
+
+{% if result %}
+<section class="card">
+  <h2>筛查结果
+    <span class="muted small">下限 ≥{{ result.threshold }} 题 · {{ result.seat_order|length }} 个座位</span>
+  </h2>
+  {% if result.reason %}<div class="banner info">{{ result.reason }}</div>{% endif %}
+
+  <h3>达到下限的邻座对 <span class="badge">{{ result.matches|length }}</span></h3>
+  {% if result.matches %}
+    <div class="table-wrap">
+    <table class="compact">
+      <thead>
+        <tr><th>邻座</th><th>卡号</th><th>所用卷式</th><th>同错题数</th><th>同错题码</th></tr>
+      </thead>
+      <tbody>
+      {% for m in result.matches %}
+        <tr>
+          <td>{{ m.seat_a }} – {{ m.seat_b }}</td>
+          <td>{{ m.card_a }} / {{ m.card_b }}</td>
+          <td>{{ m.form_a }} / {{ m.form_b }}</td>
+          <td>{{ m.count }}</td>
+          <td class="code">{{ m.codes|join(', ') }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  {% else %}
+    <p class="muted">没有邻座对达到该下限。</p>
+  {% endif %}
+
+  <h3>整排所用卷式</h3>
+  <p class="muted small">每张卡只用一种相容卷式，整排按同一选择求解；下面是本次结果采用的卷式。</p>
+  <div class="table-wrap">
+  <table class="compact">
+    <thead><tr><th>座号</th><th>卡号</th><th>所用卷式</th></tr></thead>
+    <tbody>
+    {% for seat in result.seat_order %}
+      <tr>
+        <td>{{ seat }}</td>
+        <td>{{ result.cards.get(seat) or '—' }}</td>
+        <td>{{ result.assignments.get(seat) or '—' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <p class="muted small">涉及卷式：{{ result.used_forms|join('、') if result.used_forms else '—' }}</p>
+</section>
+
+<section class="card">
+  <h3>全部相邻座位对</h3>
+  <div class="table-wrap">
+  <table class="compact">
+    <thead>
+      <tr><th>邻座</th><th>卡号</th><th>所用卷式</th><th>同错题数</th><th>状态</th></tr>
+    </thead>
+    <tbody>
+    {% for p in result.pairs %}
+      <tr>
+        <td>{{ p.seat_a }} – {{ p.seat_b }}</td>
+        <td>{{ p.card_a }} / {{ p.card_b }}</td>
+        <td>{{ (p.form_a or '—') ~ ' / ' ~ (p.form_b or '—') }}</td>
+        <td>{{ p.codes|length if p.eligible else '—' }}</td>
+        <td>
+          {% if not p.eligible %}<span class="tag warn">不比较</span> <span class="muted small">{{ p.reason }}</span>
+          {% elif p.matched %}<span class="tag danger">达到下限</span>
+          {% else %}<span class="tag">未达下限</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

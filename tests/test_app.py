@@ -531,3 +531,308 @@ def test_queued_job_replayed_after_restart(app):
         time.sleep(0.05)
     assert result is not None
     assert result["stats"]["Q1"]["counted"] == 1
+
+
+# --------------------------------------------------------------------------
+# Same-mistake neighbour screening
+# --------------------------------------------------------------------------
+
+def seat_csv(rows):
+    return "座号,卡号\n" + "".join(f"{s},{c}\n" for s, c in rows)
+
+
+def key_csv(rows):
+    return "标准题码,正确标准选项\n" + "".join(f"{c},{o}\n" for c, o in rows)
+
+
+def screen_post(client, run_id, seats, key, threshold):
+    return client.post(
+        f"/runs/{run_id}/screen",
+        data={
+            "seats": (io.BytesIO(seats.encode("utf-8")), "seats.csv"),
+            "key": (io.BytesIO(key.encode("utf-8")), "key.csv"),
+            "threshold": str(threshold),
+        },
+        content_type="multipart/form-data",
+    )
+
+
+def screen_engine(app, run_id, seats, key, threshold):
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        try:
+            return engine.screen_snapshot(
+                conn, run_id,
+                engine.parse_seat_csv(seats.encode("utf-8")),
+                engine.parse_key_csv(key.encode("utf-8")),
+                threshold,
+            )
+        finally:
+            conn.close()
+
+
+# Two forms where the same printed letters mean different standard options,
+# so the same physical card can have several compatible forms with different
+# normalised answers.
+POOL_FORM = form_csv([
+    ("1", "A", "Q1", "A"), ("1", "B", "Q1", "B"),
+    ("2", "A", "Q2", "A"), ("2", "B", "Q2", "B"),
+])
+SWAP_FORM = form_csv([
+    ("1", "A", "Q1", "B"), ("1", "B", "Q1", "A"),
+    ("2", "A", "Q2", "B"), ("2", "B", "Q2", "A"),
+])
+THREE_Q_KEY = key_csv([("Q1", "A"), ("Q2", "A")])
+
+
+def test_snapshot_records_compatible_forms_and_normalised_answers(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/forms", SWAP_FORM, name="B卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", ""), ("C1", "2", "B", ""),
+    ]))
+    run = current_run(app)
+    assert run["screenable"] is True
+    assert [c["card_no"] for c in run["card_forms"]] == ["C1"]
+    forms = run["card_forms"][0]["forms"]
+    assert {f["form_name"] for f in forms} == {"A卷", "B卷"}
+    by_name = {f["form_name"]: f for f in forms}
+    assert by_name["A卷"]["answers"]["Q1"]["std_option"] == "A"
+    assert by_name["B卷"]["answers"]["Q1"]["std_option"] == "B"
+    assert by_name["A卷"]["answers"]["Q2"]["std_option"] == "B"
+
+
+def test_screen_counts_only_same_wrong_option(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),   # Q1 B(wrong), Q2 B(wrong)
+        ("C2", "1", "B", ""), ("C2", "2", "A", ""),   # Q1 B(wrong), Q2 A(right)
+        ("C3", "1", "", ""), ("C3", "2", "B", ""),    # blank is not a choice
+    ]))
+    run = current_run(app)
+    result = screen_engine(app, run["id"], seat_csv([("1", "C1"), ("2", "C2")]),
+                           THREE_Q_KEY, 2)
+    assert result.best_count == 0
+    assert result.matches == []
+
+    result = screen_engine(app, run["id"], seat_csv([("1", "C1"), ("2", "C2")]),
+                           THREE_Q_KEY, 1)
+    assert [(m["card_a"], m["card_b"], m["codes"]) for m in result.matches] == [
+        ("C1", "C2", ["Q1"]),
+    ]
+
+
+def test_screen_uses_normalised_answers_across_forms(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/forms", SWAP_FORM, name="B卷")
+    # C1 letter B -> Q1=B under A卷, Q1=A under B卷.  C2 letter A -> A / B.
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+        ("C2", "1", "A", ""), ("C2", "2", "B", ""),
+    ]))
+    run = current_run(app)
+    # Under different forms they disagree; same form gives Q1=A right + Q2=B
+    # wrong => 1 shared mistake.  Threshold 2 is unreachable.
+    assert screen_engine(app, run["id"],
+                         seat_csv([("1", "C1"), ("2", "C2")]),
+                         THREE_Q_KEY, 2).matches == []
+    result = screen_engine(app, run["id"],
+                           seat_csv([("1", "C1"), ("2", "C2")]),
+                           THREE_Q_KEY, 1)
+    assert result.matches and result.matches[0]["codes"] == ["Q2"]
+    # One form per card, applied across the whole row.
+    assert result.matches[0]["form_a"] == result.matches[0]["form_b"]
+
+
+def test_screen_requires_seats_to_be_adjacent(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+        ("C2", "1", "B", ""), ("C2", "2", "B", ""),
+    ]))
+    run = current_run(app)
+    result = screen_engine(app, run["id"],
+                           seat_csv([("1", "C1"), ("3", "C2")]),
+                           THREE_Q_KEY, 1)
+    assert result.pairs and result.pairs[0]["adjacent"] is False
+    assert result.matches == []
+
+
+def test_screen_maximises_number_of_matching_pairs(client, app):
+    # Non-adjacent forms would give C1/C2 1 shared mistake; choosing the swap
+    # form for C1 gives 2 shared mistakes but the DP should prefer the count.
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+        ("C2", "1", "B", ""), ("C2", "2", "B", ""),
+    ]))
+    run = current_run(app)
+    result = screen_engine(app, run["id"],
+                           seat_csv([("1", "C1"), ("2", "C2")]),
+                           THREE_Q_KEY, 2)
+    assert [(m["codes"], m["count"]) for m in result.matches] == [(["Q1", "Q2"], 2)]
+
+
+def test_screen_handles_cards_without_compatible_form(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+        ("C9", "1", "A", "WRONG"),
+        ("C3", "1", "B", ""), ("C3", "2", "B", ""),
+    ]))
+    run = current_run(app)
+    result = screen_engine(
+        app, run["id"],
+        seat_csv([("1", "C1"), ("2", "C9"), ("3", "C3")]),
+        THREE_Q_KEY, 1,
+    )
+    assert result.best_count == 0
+    assert all(not p["eligible"] for p in result.pairs)
+
+
+def test_screen_rejects_more_than_30_seats(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+    ]))
+    run = current_run(app)
+    seats = seat_csv([(str(i), f"C{i}") for i in range(1, 32)])
+    resp = screen_post(client, run["id"], seats, THREE_Q_KEY, 1)
+    assert resp.status_code == 400
+    assert "30" in resp.get_data(as_text=True)
+
+
+def test_screen_rejects_duplicate_seat_or_card(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+    ]))
+    run = current_run(app)
+    for bad in (seat_csv([("1", "C1"), ("1", "C2")]),
+                seat_csv([("1", "C1"), ("2", "C1")])):
+        resp = screen_post(client, run["id"], bad, THREE_Q_KEY, 1)
+        assert resp.status_code == 400
+
+
+def test_screen_uses_snapshot_after_answer_reupload(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+        ("C2", "1", "B", ""), ("C2", "2", "B", ""),
+    ]))
+    first = current_run(app)["id"]
+    # Replace answers with all-correct ones.
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", ""), ("C1", "2", "A", ""),
+        ("C2", "1", "A", ""), ("C2", "2", "A", ""),
+    ]))
+    assert current_run(app)["id"] != first
+    old = screen_engine(app, first, seat_csv([("1", "C1"), ("2", "C2")]),
+                        THREE_Q_KEY, 2)
+    assert [(m["codes"], m["count"]) for m in old.matches] == [(["Q1", "Q2"], 2)]
+    new = screen_engine(app, current_run(app)["id"],
+                        seat_csv([("1", "C1"), ("2", "C2")]), THREE_Q_KEY, 1)
+    assert new.matches == []
+
+
+def test_screen_uses_snapshot_after_form_correction(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+        ("C2", "1", "B", ""), ("C2", "2", "B", ""),
+    ]))
+    first = current_run(app)["id"]
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        form_id = conn.execute("SELECT id FROM forms").fetchone()["id"]
+        conn.close()
+    client.post("/forms/correct", data={
+        "form_id": str(form_id), "q_no": "1", "new_code": "Q1X",
+    }, follow_redirects=True)
+    # The old snapshot still answers with Q1, so screening is unchanged.
+    old = screen_engine(app, first, seat_csv([("1", "C1"), ("2", "C2")]),
+                        THREE_Q_KEY, 2)
+    assert [(m["codes"], m["count"]) for m in old.matches] == [(["Q1", "Q2"], 2)]
+
+
+def test_old_snapshot_without_screen_data_is_rejected(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+    ]))
+    run_id = current_run(app)["id"]
+    # Simulate a snapshot taken before screening data was recorded.
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        conn.execute("DELETE FROM run_card_forms WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM run_card_form_answers WHERE run_id = ?", (run_id,))
+        conn.close()
+    page = client.get(f"/runs/{run_id}/screen")
+    assert page.status_code == 200
+    assert "无法筛查" in page.get_data(as_text=True)
+    resp = screen_post(client, run_id, seat_csv([("1", "C1")]), THREE_Q_KEY, 1)
+    assert resp.status_code == 422
+    assert "无法筛查" in resp.get_data(as_text=True)
+
+
+def test_screen_page_lists_results(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+        ("C2", "1", "B", ""), ("C2", "2", "B", ""),
+    ]))
+    run = current_run(app)
+    resp = screen_post(client, run["id"], seat_csv([("1", "C1"), ("2", "C2")]),
+                       THREE_Q_KEY, 2)
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    assert "Q1, Q2" in html
+    assert "A卷" in html
+
+
+def test_screen_does_not_touch_live_state(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+        ("C2", "1", "B", ""), ("C2", "2", "B", ""),
+    ]))
+    run = current_run(app)
+    before = stats_of(run)
+    screen_post(client, run["id"], seat_csv([("1", "C1"), ("2", "C2")]),
+                THREE_Q_KEY, 2)
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        try:
+            assert db.active_run_id(conn) == run["id"]
+            assert conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"] == 2
+        finally:
+            conn.close()
+    assert stats_of(current_run(app)) == before
+
+
+def test_screen_threshold_must_be_positive_integer(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+    ]))
+    run = current_run(app)
+    for bad in ("0", "-1", "abc", ""):
+        resp = screen_post(client, run["id"], seat_csv([("1", "C1")]),
+                           THREE_Q_KEY, bad)
+        assert resp.status_code == 400, bad
+
+
+def test_screen_requires_all_three_inputs(client, app):
+    upload(client, "/forms", POOL_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "B", ""),
+    ]))
+    run = current_run(app)
+    resp = client.post(
+        f"/runs/{run['id']}/screen",
+        data={"key": (io.BytesIO(THREE_Q_KEY.encode()), "key.csv"),
+              "threshold": "1"},
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 400
+    assert "座位 CSV" in resp.get_data(as_text=True)

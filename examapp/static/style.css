@@ -117,8 +117,7 @@ button, .button {
 button:hover, .button:hover { filter: brightness(1.06); }
 .button.ghost { background: #fff; color: var(--accent); }
 
-.review-form { margin: 0; gap: 6px; }
-.review-form input[type=text] { width: 130px; }
+.review-form { margin: 0; gap: 6px; }.review-form input[type=text] { width: 130px; }
 .review-cell { min-width: 340px; }
 .review-form button { padding: 5px 10px; }
 
@@ -156,3 +155,16 @@ td.danger { color: var(--danger); font-weight: 600; }
   main { padding: 14px; }
   .topbar { gap: 12px; padding: 10px 14px; }
 }
+
+/* Screening page */
+.screen-form { flex-direction: column; align-items: stretch; gap: 12px; }
+.screen-form label { display: flex; flex-direction: column; gap: 4px; font-size: 13.5px; }
+.screen-form input[type=number] {
+  padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px;
+  font: inherit; width: 120px;
+}
+.screen-form button { align-self: flex-start; }
+h3 { margin: 18px 0 8px; font-size: 15px; }
+.card-forms { border-top: 1px dashed var(--line); padding: 8px 0; }
+.card-forms summary { cursor: pointer; padding: 4px 0; }
+.card-forms summary:hover { color: var(--accent); }

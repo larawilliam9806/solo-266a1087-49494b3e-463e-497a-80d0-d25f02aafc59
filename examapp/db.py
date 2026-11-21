@@ -90,6 +90,35 @@ CREATE TABLE IF NOT EXISTS run_unmatched (
     PRIMARY KEY (run_id, card_no)
 );
 
+-- Immutable snapshot of every card's compatible forms at run-generation time.
+-- form_id/form_name are copied (not joined to the live forms table) so later
+-- form replacements cannot change what a retained snapshot says.
+CREATE TABLE IF NOT EXISTS run_card_forms (
+    run_id    INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    card_no   TEXT NOT NULL,
+    form_id   INTEGER NOT NULL,
+    form_name TEXT NOT NULL,
+    form_order INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, card_no, form_id)
+);
+CREATE INDEX IF NOT EXISTS idx_run_card_forms_card
+    ON run_card_forms(run_id, card_no);
+
+-- Normalised scanned answer for one card under one compatible form:
+-- printed question number / filled letter -> standard option.
+CREATE TABLE IF NOT EXISTS run_card_form_answers (
+    run_id     INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    card_no    TEXT NOT NULL,
+    form_id    INTEGER NOT NULL,
+    std_code   TEXT NOT NULL,
+    q_no       TEXT NOT NULL DEFAULT '',
+    letter     TEXT NOT NULL DEFAULT '',
+    std_option TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (run_id, card_no, form_id, std_code)
+);
+CREATE INDEX IF NOT EXISTS idx_run_card_form_answers_card
+    ON run_card_form_answers(run_id, card_no);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT NOT NULL,
